@@ -2,16 +2,21 @@
 
 One job: take the user task, return an ordered list of concrete steps.
 
-Phase 1 = stub. Real LLM call comes in phase 1 task 3. For now we generate
-a deterministic skeleton so the graph can be wired and tested end-to-end.
+Strategy:
+  - try LLM (Groq) for a real, task-specific plan
+  - on any failure (no key, network, parse error) fall back to the template
+    heuristics so the graph never stalls mid-pipeline
+
+Templates remain as the safety net, NOT the primary path.
 """
 from __future__ import annotations
 
 import re
 
 from graph.state import SessionState
+from llm import chat_text
 
-# hard-coded templates for common task patterns so phase 1 has signal
+# hard-coded templates for common task patterns -- used only as fallback
 _PATTERNS: list[tuple[re.Pattern[str], list[str]]] = [
     (
         re.compile(r"\b(add|create|implement)\b.*\b(dark\s*mode|dark\s*theme|theme\s*toggle)\b", re.I),
@@ -47,7 +52,6 @@ def _template_steps(task: str) -> list[str]:
     for pat, steps in _PATTERNS:
         if pat.search(task):
             return steps
-    # default generic skeleton
     return [
         f"Investigate: identify the files relevant to: {task}",
         "Plan: enumerate the changes required to satisfy the request.",
@@ -56,8 +60,61 @@ def _template_steps(task: str) -> list[str]:
     ]
 
 
+# ---------- LLM plan generation ----------
+
+_SYSTEM_PROMPT = """\
+You are the Planner agent inside Forge, an autonomous AI software engineer.
+Given a natural-language feature request, break it into a small ordered list
+of CONCRETE engineering steps a coding agent can execute one by one.
+
+Rules:
+- Output ONLY a JSON array of strings, nothing else. No prose, no markdown fences.
+- 3-7 steps. Each step names the file, component, or concrete action.
+- Steps should be ordered: investigation -> design -> implementation -> verification.
+- Never reference agents, never mention "the user". Write as engineering tickets.
+- Do not include steps that aren't needed (e.g. "run tests" if the task is trivial).
+- Keep the entire JSON parseable in one call.
+"""
+
+
+def _parse_steps(raw: str) -> list[str] | None:
+    """Tolerate ```json fences, leading/trailing junk. Return list or None."""
+    if not raw:
+        return None
+    s = raw.strip()
+    # strip ```json / ``` fences if present
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    # find the first [ and last ]
+    start = s.find("[")
+    end = s.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    import json
+    try:
+        data = json.loads(s[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        return None
+    if not data:
+        return None
+    return [x.strip() for x in data if x.strip()]
+
+
 def plan_steps(task: str) -> list[str]:
-    """Public API. Returns ordered step strings. Pure function."""
+    """LLM-first, template fallback. Pure function."""
+    if not task.strip():
+        return []
+    try:
+        raw = chat_text(_SYSTEM_PROMPT, f"Task: {task}", max_tokens=512)
+        parsed = _parse_steps(raw)
+        if parsed:
+            return parsed
+    except Exception:
+        # network / auth / rate-limit / parse -- fall through to templates
+        pass
     return _template_steps(task)
 
 
