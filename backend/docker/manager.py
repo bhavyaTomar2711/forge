@@ -1,0 +1,171 @@
+"""Container manager for forge.
+
+One container per session, repo mounted as a bind volume so file edits from
+the host (the Coding Agent writes directly) are visible inside the container
+for the build pipeline. Per FORGE_BRAIN.md Docker Setup.
+
+Lifecycle:
+  start_session(session_id, repo_path) -> container_id
+  run_command(session_id, cmd)         -> (exit_code, stdout, stderr)
+  stop_session(session_id)             -> None
+
+State is in-memory keyed by session_id. Cleanup on idle is phase 4+ work.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _resolve_docker_bin() -> str:
+    explicit = os.getenv("FORGE_DOCKER_BIN")
+    if explicit and Path(explicit).exists():
+        return explicit
+    on_path = shutil.which("docker")
+    if on_path:
+        return on_path
+    candidates = [
+        r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+        r"C:\Program Files\Docker\Docker\docker.exe",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return "docker"
+
+
+DOCKER_BIN = _resolve_docker_bin()
+DEFAULT_IMAGE = os.getenv("FORGE_DOCKER_IMAGE", "forge-runner:latest")
+DEFAULT_TIMEOUT_S = 600
+
+
+@dataclass
+class _Session:
+    container_id: str
+    repo_path: str
+    workdir: str = "/workspace"
+    image: str = DEFAULT_IMAGE
+
+
+_sessions: dict[str, _Session] = {}
+_lock = threading.Lock()
+
+
+def _run_docker(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a docker CLI command. Forces utf-8 decode so npm output (which can
+    contain chars outside cp1252) doesn't crash on Windows."""
+    # On Windows + Python 3.11, the default text encoding is the active code
+    # page (e.g. cp1252). Force utf-8 by reading bytes ourselves.
+    proc = subprocess.run([DOCKER_BIN, *args], capture_output=True, timeout=timeout)
+    out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+    err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    # mimic CompletedProcess(text=True) shape
+    proc.stdout = out
+    proc.stderr = err
+    return proc
+
+
+# ---------- image build ----------
+
+def build_image(tag: str = DEFAULT_IMAGE, dockerfile_dir: str | Path | None = None,
+                verbose: bool = False) -> tuple[int, str, str]:
+    if dockerfile_dir is None:
+        dockerfile_dir = Path(__file__).resolve().parent
+    proc = _run_docker([
+        "build",
+        "-t", tag,
+        "-f", str(Path(dockerfile_dir) / "Dockerfile"),
+        str(dockerfile_dir),
+    ], timeout=900)
+    if verbose or proc.returncode != 0:
+        return proc.returncode, proc.stdout, proc.stderr
+    return proc.returncode, "", ""
+
+
+def image_exists(tag: str = DEFAULT_IMAGE) -> bool:
+    proc = _run_docker(["image", "inspect", tag], timeout=30)
+    return proc.returncode == 0
+
+
+# ---------- session lifecycle ----------
+
+def start_session(session_id: str, repo_path: str | Path,
+                  *, image: str = DEFAULT_IMAGE,
+                  network: bool = True) -> str:
+    repo = Path(repo_path).resolve()
+    if not repo.exists() or not repo.is_dir():
+        raise ValueError(f"repo path not found or not a directory: {repo}")
+
+    mount_src = str(repo)
+
+    flags = ["-d"]
+    if not network:
+        flags += ["--network=none"]
+
+    proc = _run_docker([
+        "run", *flags,
+        "-v", f"{mount_src}:/workspace",
+        "-w", "/workspace",
+        image,
+        "sleep", "infinity",
+    ], timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"docker run failed (exit {proc.returncode}):\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+    container_id = proc.stdout.strip()
+    if not container_id:
+        raise RuntimeError(f"docker run returned empty container id. stderr: {proc.stderr}")
+
+    with _lock:
+        _sessions[session_id] = _Session(
+            container_id=container_id, repo_path=str(repo), image=image,
+        )
+    return container_id
+
+
+def stop_session(session_id: str) -> None:
+    with _lock:
+        s = _sessions.pop(session_id, None)
+    if not s:
+        return
+    _run_docker(["rm", "-f", s.container_id], timeout=60)
+
+
+def get_session(session_id: str) -> _Session | None:
+    with _lock:
+        return _sessions.get(session_id)
+
+
+def list_sessions() -> list[str]:
+    with _lock:
+        return list(_sessions.keys())
+
+
+# ---------- command execution ----------
+
+def run_command(session_id: str, cmd: str, *, timeout_s: int = DEFAULT_TIMEOUT_S,
+                workdir: str | None = None) -> tuple[int, str, str]:
+    s = get_session(session_id)
+    if not s:
+        raise KeyError(f"no session: {session_id}")
+
+    wd = workdir or s.workdir
+    proc = _run_docker([
+        "exec",
+        "-w", wd,
+        s.container_id,
+        "bash", "-lc", cmd,
+    ], timeout=timeout_s)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_command_quiet(session_id: str, cmd: str, *,
+                      timeout_s: int = DEFAULT_TIMEOUT_S) -> int:
+    code, _, _ = run_command(session_id, cmd, timeout_s=timeout_s)
+    return code

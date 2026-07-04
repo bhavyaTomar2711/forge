@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 
 class SessionState(TypedDict, total=False):
     # --- session identity / context ---
+    session_id: str               # unique id, used by docker manager to key the container
     repo_path: str                # absolute path to the cloned repo on disk
     task: str                     # current user instruction (latest message)
     attachments: list[str]        # file paths/URLs for uploaded images, if any
