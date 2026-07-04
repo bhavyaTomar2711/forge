@@ -13,6 +13,7 @@ State is in-memory keyed by session_id. Cleanup on idle is phase 4+ work.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -58,12 +59,9 @@ _lock = threading.Lock()
 def _run_docker(args: list[str], timeout: int) -> subprocess.CompletedProcess:
     """Run a docker CLI command. Forces utf-8 decode so npm output (which can
     contain chars outside cp1252) doesn't crash on Windows."""
-    # On Windows + Python 3.11, the default text encoding is the active code
-    # page (e.g. cp1252). Force utf-8 by reading bytes ourselves.
     proc = subprocess.run([DOCKER_BIN, *args], capture_output=True, timeout=timeout)
     out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
     err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
-    # mimic CompletedProcess(text=True) shape
     proc.stdout = out
     proc.stderr = err
     return proc
@@ -145,6 +143,24 @@ def get_session(session_id: str) -> _Session | None:
 def list_sessions() -> list[str]:
     with _lock:
         return list(_sessions.keys())
+
+
+def stop_all() -> None:
+    """Stop every session this process started. Used by atexit + tests."""
+    with _lock:
+        sids = list(_sessions.keys())
+    for sid in sids:
+        try:
+            stop_session(sid)
+        except Exception:
+            # best-effort cleanup; never raise from atexit
+            pass
+
+
+# On interpreter shutdown, kill any containers we still own so a crashing
+# test script doesn't leave orphans. Phase 4 will replace this with a real
+# idle-timeout sweeper.
+atexit.register(stop_all)
 
 
 # ---------- command execution ----------

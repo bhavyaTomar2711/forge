@@ -28,6 +28,7 @@ class SessionState(TypedDict, total=False):
     build_output: str             # last Terminal Agent run stdout+stderr
     build_passed: bool
     qa_result: dict[str, Any]     # pass/fail + details from Playwright checks
+    failure_message: str          # user-facing summary when retries are exhausted
 
     # --- control ---
     retry_count: int

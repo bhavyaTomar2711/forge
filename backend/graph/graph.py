@@ -4,6 +4,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from agents.coding import coding_node
+from agents.failure import failure_summary_node
 from agents.git import git_node
 from agents.planner import planner_node
 from agents.qa import qa_node
@@ -25,7 +26,7 @@ def _route_after_terminal(state: SessionState) -> str:
         return "qa"
     if state.get("retry_count", 0) < state.get("max_retries", DEFAULT_MAX_RETRIES):
         return "retry"
-    return END
+    return "failure_summary"
 
 
 def _route_after_qa(state: SessionState) -> str:
@@ -34,7 +35,7 @@ def _route_after_qa(state: SessionState) -> str:
         return END
     if state.get("retry_count", 0) < state.get("max_retries", DEFAULT_MAX_RETRIES):
         return "retry"
-    return END
+    return "failure_summary"
 
 
 def build_graph() -> StateGraph:
@@ -47,23 +48,23 @@ def build_graph() -> StateGraph:
     g.add_node("qa", qa_node)
     g.add_node("git", git_node)
     g.add_node("retry", _bump_retry)
+    g.add_node("failure_summary", failure_summary_node)
 
     g.add_edge(START, "planner")
     g.add_edge("planner", "repository")
     g.add_edge("repository", "coding")
     g.add_edge("coding", "terminal")
-    g.add_edge("terminal", "qa")
-    g.add_edge("qa", END)
     g.add_edge("git", END)
     g.add_edge("retry", "coding")
+    g.add_edge("failure_summary", END)
 
     g.add_conditional_edges(
         "terminal", _route_after_terminal,
-        {"qa": "qa", "retry": "retry", END: END},
+        {"qa": "qa", "retry": "retry", "failure_summary": "failure_summary"},
     )
     g.add_conditional_edges(
         "qa", _route_after_qa,
-        {"retry": "retry", END: END},
+        {"retry": "retry", "failure_summary": "failure_summary", END: END},
     )
 
     return g.compile()
