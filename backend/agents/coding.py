@@ -61,6 +61,15 @@ CRITICAL FORMATTING RULES (the response must parse as valid JSON):
     files list.
   - Keep changes minimal. Preserve the project's existing style, imports,
     naming, and TypeScript/TSX conventions.
+  - Next.js App Router rule: any component that uses React hooks (useState,
+    useEffect, etc.), event handlers (onClick, onChange, ...), or browser-only
+    APIs (window, localStorage, document) MUST start with this EXACT literal
+    first line (a quoted string, not bare words):
+        "use client";
+    Root layout / server components must NOT call localStorage/window/document
+    directly -- only client components (behind "use client") may.
+  - If PREVIOUS ATTEMPT FAILED is present, the build error tells you exactly
+    what's wrong -- fix that specific error, don't just re-edit unrelated files.
   - If the task is impossible or already done, return:
     {"edits":{}, "new_files":{}, "reason":"<why>"}
 
@@ -253,6 +262,19 @@ def _diff_summary(original: str, new: str) -> dict:
 
 # ---------- public API ----------
 
+# Groq/llama sometimes emits `use client;` (bare, no quotes) instead of the
+# required string-literal directive `"use client";` -- fix it deterministically
+# rather than relying on prompt wording alone (observed even with an explicit
+# example in the system prompt).
+_BARE_USE_CLIENT_RE = re.compile(r'^\s*use client\s*;?\s*\n', re.MULTILINE)
+
+
+def _normalize_use_client(content: str) -> str:
+    if _BARE_USE_CLIENT_RE.match(content):
+        return '"use client";\n' + content[_BARE_USE_CLIENT_RE.match(content).end():]
+    return content
+
+
 def generate_edits(
     task: str,
     plan: list[str],
@@ -265,6 +287,8 @@ def generate_edits(
     parsed = _parse_response(raw)
     if not parsed:
         raise ValueError("LLM response did not contain valid JSON edits")
+    parsed["edits"] = {p: _normalize_use_client(c) for p, c in parsed["edits"].items()}
+    parsed["new_files"] = {p: _normalize_use_client(c) for p, c in parsed["new_files"].items()}
     allowed = set(relevant_files.keys())
     edits, new_files, dropped = _scope_check(parsed["edits"], parsed["new_files"], allowed)
     return {
@@ -320,7 +344,17 @@ def coding_node(state: SessionState) -> dict:
     task = state.get("task", "")
     plan = state.get("plan") or []
     relevant = state.get("relevant_files") or {}
-    error_ctx = state.get("build_output", "") if not state.get("build_passed") else ""
+    qa = state.get("qa_result") or {}
+    if not state.get("build_passed"):
+        error_ctx = state.get("build_output", "")
+    elif qa and not qa.get("passed") and not qa.get("skipped"):
+        error_ctx = (
+            "The build succeeded but the QA browser check failed:\n"
+            f"{qa}\n"
+            "Fix the actual behavior described above (this is not a build/compile error)."
+        )
+    else:
+        error_ctx = ""
 
     if not repo_path or not relevant:
         return {

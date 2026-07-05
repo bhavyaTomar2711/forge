@@ -1,13 +1,14 @@
 """QA Agent.
 
-Phase 3 part 1: generic browser-level check. Launches the app the Terminal
-Agent started (npm start, inside the docker container) and confirms via
-Playwright that the page actually loads in a real browser -- not just that
-the build compiled. Task-specific checks (phase 3 part 2) build on top of
-this by adding assertions to `_run_checks`.
+Phase 3 part 1: generic browser-level check -- page loads, no console errors.
+Phase 3 part 2: task-specific checks layered on top. The task text is pattern
+-matched (same style as the Planner Agent's regex fallback) to decide which
+extra assertions to run, e.g. dark mode -> find toggle, click it, confirm the
+page actually changed appearance, reload, confirm it persisted.
 """
 from __future__ import annotations
 
+import re
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ from docker import manager as docker_mgr
 _SERVER_READY_TIMEOUT_S = 30
 _SERVER_READY_POLL_S = 1
 _PAGE_LOAD_TIMEOUT_MS = 15_000
+_DARK_MODE_TASK_RE = re.compile(r"dark\s*mode|theme\s*toggle|light\s*/\s*dark", re.I)
 
 
 def _wait_for_server(url: str, timeout_s: int = _SERVER_READY_TIMEOUT_S) -> bool:
@@ -34,9 +36,50 @@ def _wait_for_server(url: str, timeout_s: int = _SERVER_READY_TIMEOUT_S) -> bool
     return False
 
 
-def _run_checks(url: str) -> dict:
-    """Generic checks: page loads, no console errors, no uncaught exceptions.
-    Returns a qa_result dict. Task-specific checks get added here in part 2."""
+def _find_toggle(page):
+    """Heuristic locator for a dark-mode/theme toggle: any clickable element
+    whose visible text or aria-label mentions dark/light/theme. Implementation
+    details (class names, storage keys) are the Coding Agent's choice, so we
+    don't assume any of that -- just find *something* clickable and themed."""
+    candidates = [
+        page.locator("button, [role=button], a").filter(has_text=re.compile(r"dark|light|theme", re.I)),
+        page.locator("[aria-label*='dark' i], [aria-label*='theme' i], [aria-label*='light' i]"),
+        page.locator("[data-testid*='theme' i], [data-testid*='dark' i]"),
+    ]
+    for loc in candidates:
+        if loc.count() > 0:
+            return loc.first
+    return None
+
+
+def _check_dark_mode(page) -> dict:
+    """Task-specific check for a dark mode toggle: it must exist, clicking it
+    must visibly change the page (background color), and a reload must keep
+    the new state (persistence)."""
+    toggle = _find_toggle(page)
+    if toggle is None:
+        return {"dark_mode_check": "failed", "reason": "no theme/dark-mode toggle found on page"}
+
+    before = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    toggle.click()
+    page.wait_for_timeout(300)
+    after = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    if after == before:
+        return {"dark_mode_check": "failed", "reason": "clicking toggle did not change page appearance"}
+
+    page.reload(wait_until="load")
+    page.wait_for_timeout(300)
+    persisted = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    if persisted != after:
+        return {"dark_mode_check": "failed", "reason": "theme did not persist across reload",
+                "before": before, "after_click": after, "after_reload": persisted}
+
+    return {"dark_mode_check": "passed", "before": before, "after_click": after}
+
+
+def _run_checks(url: str, task: str = "") -> dict:
+    """Generic checks (page loads, no console errors) plus any task-specific
+    assertions matched from the task text."""
     from playwright.sync_api import sync_playwright
 
     console_errors: list[str] = []
@@ -54,13 +97,22 @@ def _run_checks(url: str) -> dict:
             status = response.status if response else None
             passed = bool(status and status < 400) and not page_errors
 
-            return {
+            task_check = None
+            if passed and _DARK_MODE_TASK_RE.search(task or ""):
+                task_check = _check_dark_mode(page)
+                if task_check.get("dark_mode_check") != "passed":
+                    passed = False
+
+            result = {
                 "passed": passed,
                 "url": url,
                 "http_status": status,
                 "console_errors": console_errors,
                 "page_errors": page_errors,
             }
+            if task_check:
+                result["task_check"] = task_check
+            return result
         finally:
             browser.close()
 
@@ -88,7 +140,7 @@ def qa_node(state: SessionState) -> dict:
         }
 
     try:
-        qa_result = _run_checks(url)
+        qa_result = _run_checks(url, state.get("task", ""))
     except Exception as e:
         return {
             "qa_result": {"passed": False, "url": url, "reason": f"qa check crashed: {e}"},
