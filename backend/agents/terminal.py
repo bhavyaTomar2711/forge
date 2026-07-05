@@ -99,6 +99,24 @@ def terminal_node(state: SessionState) -> dict:
         if code != 0:
             overall_pass = False
 
+    # step 4: start the app server in the background so the QA agent can
+    # hit it with Playwright. only if build passed and a `start` script exists.
+    if overall_pass:
+        has_start = docker_mgr.run_command_quiet(
+            session_id,
+            "node -e \"const p=require('./package.json'); process.exit(p.scripts&&p.scripts.start?0:1)\"",
+            timeout_s=15,
+        ) == 0
+        if has_start:
+            out_parts.append(_header("STEP 4: starting app server"))
+            try:
+                docker_mgr.start_server(session_id, "npm start")
+                out_parts.append("server started in background (npm start)")
+            except Exception as e:
+                out_parts.append(f"failed to start server: {e}")
+        else:
+            out_parts.append(_header("STEP 4: skipped (no start script)"))
+
     combined = _truncate("\n".join(out_parts))
     return {
         "build_output": combined,

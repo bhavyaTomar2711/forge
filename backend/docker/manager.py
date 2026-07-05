@@ -91,9 +91,11 @@ def image_exists(tag: str = DEFAULT_IMAGE) -> bool:
 
 # ---------- session lifecycle ----------
 
+APP_PORT = 3000  # container-side port Next.js apps listen on (npm start / next start)
+
 def start_session(session_id: str, repo_path: str | Path,
                   *, image: str = DEFAULT_IMAGE,
-                  network: bool = True) -> str:
+                  network: bool = True, publish_app_port: bool = True) -> str:
     repo = Path(repo_path).resolve()
     if not repo.exists() or not repo.is_dir():
         raise ValueError(f"repo path not found or not a directory: {repo}")
@@ -103,6 +105,9 @@ def start_session(session_id: str, repo_path: str | Path,
     flags = ["-d"]
     if not network:
         flags += ["--network=none"]
+    if publish_app_port:
+        # publish to an OS-assigned host port; resolved later via get_app_port()
+        flags += ["-p", f"0:{APP_PORT}"]
 
     proc = _run_docker([
         "run", *flags,
@@ -185,3 +190,35 @@ def run_command_quiet(session_id: str, cmd: str, *,
                       timeout_s: int = DEFAULT_TIMEOUT_S) -> int:
     code, _, _ = run_command(session_id, cmd, timeout_s=timeout_s)
     return code
+
+
+# ---------- app server (for QA agent) ----------
+
+def start_server(session_id: str, cmd: str = "npm start", *,
+                 workdir: str | None = None) -> None:
+    """Start the app's server in the background inside the container.
+    Fire-and-forget: stdout/stderr redirected to a log file in-container so
+    the exec call returns immediately instead of blocking on the long-running
+    process."""
+    s = get_session(session_id)
+    if not s:
+        raise KeyError(f"no session: {session_id}")
+    wd = workdir or s.workdir
+    bg_cmd = f"nohup {cmd} > /tmp/forge_server.log 2>&1 &"
+    _run_docker(["exec", "-w", wd, s.container_id, "bash", "-lc", bg_cmd], timeout=30)
+
+
+def get_app_port(session_id: str, *, container_port: int = APP_PORT) -> int | None:
+    """Resolve the OS-assigned host port mapped to the container's app port."""
+    s = get_session(session_id)
+    if not s:
+        return None
+    proc = _run_docker(["port", s.container_id, str(container_port)], timeout=15)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    # output like "0.0.0.0:54321\n[::]:54321"
+    first_line = proc.stdout.strip().splitlines()[0]
+    try:
+        return int(first_line.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
