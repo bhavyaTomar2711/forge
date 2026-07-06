@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 from graph.state import SessionState
-from llm import chat_text
+from llm import chat_text, chat_vision
 
 # hard-coded templates for common task patterns -- used only as fallback
 _PATTERNS: list[tuple[re.Pattern[str], list[str]]] = [
@@ -76,6 +76,23 @@ Rules:
 - Keep the entire JSON parseable in one call.
 """
 
+_VISION_SYSTEM_PROMPT = """\
+You are the Planner agent inside Forge, an autonomous AI software engineer.
+You are given a natural-language task AND one or more attached images (a bug
+screenshot or a design reference). Treat the image(s) as the primary evidence
+for what's broken or what's wanted -- read text/layout/colors directly off
+them, don't guess.
+
+Rules:
+- Output ONLY a JSON array of strings, nothing else. No prose, no markdown fences.
+- 3-7 steps. Each step names the file, component, or concrete action.
+- Steps should be ordered: investigation -> design -> implementation -> verification.
+- Reference specific visual details from the image(s) where relevant (e.g.
+  "match the button color/spacing shown in the screenshot").
+- Never reference agents, never mention "the user". Write as engineering tickets.
+- Keep the entire JSON parseable in one call.
+"""
+
 
 def _parse_steps(raw: str) -> list[str] | None:
     """Tolerate ```json fences, leading/trailing junk. Return list or None."""
@@ -103,12 +120,17 @@ def _parse_steps(raw: str) -> list[str] | None:
     return [x.strip() for x in data if x.strip()]
 
 
-def plan_steps(task: str) -> list[str]:
-    """LLM-first, template fallback. Pure function."""
-    if not task.strip():
+def plan_steps(task: str, attachments: list[str] | None = None) -> list[str]:
+    """LLM-first, template fallback. Pure function. If attachments are
+    present, uses the vision model so images inform the plan directly."""
+    attachments = attachments or []
+    if not task.strip() and not attachments:
         return []
     try:
-        raw = chat_text(_SYSTEM_PROMPT, f"Task: {task}", max_tokens=512)
+        if attachments:
+            raw = chat_vision(_VISION_SYSTEM_PROMPT, f"Task: {task}", attachments, max_tokens=512)
+        else:
+            raw = chat_text(_SYSTEM_PROMPT, f"Task: {task}", max_tokens=512)
         parsed = _parse_steps(raw)
         if parsed:
             return parsed
@@ -119,9 +141,10 @@ def plan_steps(task: str) -> list[str]:
 
 
 def planner_node(state: SessionState) -> dict:
-    """LangGraph node. Reads task, writes plan + bumps status."""
+    """LangGraph node. Reads task (+ attachments), writes plan + bumps status."""
     task = state.get("task", "")
-    plan = plan_steps(task)
+    attachments = state.get("attachments") or []
+    plan = plan_steps(task, attachments)
     return {
         "plan": plan,
         "status": "planning_done",

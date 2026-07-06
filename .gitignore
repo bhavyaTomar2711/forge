@@ -45,3 +45,4 @@ __pycache__/
 *.pyc
 *.pyo
 backend/.env
+backend/sessions/

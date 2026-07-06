@@ -29,6 +29,8 @@ class SessionState(TypedDict, total=False):
     build_passed: bool
     qa_result: dict[str, Any]     # pass/fail + details from Playwright checks
     failure_message: str          # user-facing summary when retries are exhausted
+    preview_url: str              # live local URL the running app is reachable at
+    preview_screenshot: str       # path to the latest Playwright screenshot of the app
 
     # --- control ---
     retry_count: int

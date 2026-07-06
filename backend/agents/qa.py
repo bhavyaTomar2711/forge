@@ -15,6 +15,7 @@ import urllib.request
 
 from graph.state import SessionState
 from docker import manager as docker_mgr
+from paths import session_dir
 
 _SERVER_READY_TIMEOUT_S = 30
 _SERVER_READY_POLL_S = 1
@@ -77,7 +78,18 @@ def _check_dark_mode(page) -> dict:
     return {"dark_mode_check": "passed", "before": before, "after_click": after}
 
 
-def _run_checks(url: str, task: str = "") -> dict:
+def _take_screenshot(page, session_id: str) -> str | None:
+    """Live preview (phase 4 part 2): a screenshot of current app state, so
+    a user can see progress without a real frontend yet."""
+    try:
+        path = session_dir(session_id) / "preview.png"
+        page.screenshot(path=str(path), full_page=False)
+        return str(path)
+    except Exception:
+        return None
+
+
+def _run_checks(url: str, task: str = "", session_id: str = "") -> dict:
     """Generic checks (page loads, no console errors) plus any task-specific
     assertions matched from the task text."""
     from playwright.sync_api import sync_playwright
@@ -103,6 +115,8 @@ def _run_checks(url: str, task: str = "") -> dict:
                 if task_check.get("dark_mode_check") != "passed":
                     passed = False
 
+            screenshot_path = _take_screenshot(page, session_id) if session_id else None
+
             result = {
                 "passed": passed,
                 "url": url,
@@ -112,6 +126,8 @@ def _run_checks(url: str, task: str = "") -> dict:
             }
             if task_check:
                 result["task_check"] = task_check
+            if screenshot_path:
+                result["screenshot_path"] = screenshot_path
             return result
         finally:
             browser.close()
@@ -140,7 +156,7 @@ def qa_node(state: SessionState) -> dict:
         }
 
     try:
-        qa_result = _run_checks(url, state.get("task", ""))
+        qa_result = _run_checks(url, state.get("task", ""), session_id)
     except Exception as e:
         return {
             "qa_result": {"passed": False, "url": url, "reason": f"qa check crashed: {e}"},
@@ -149,5 +165,7 @@ def qa_node(state: SessionState) -> dict:
 
     return {
         "qa_result": qa_result,
+        "preview_url": url,
+        "preview_screenshot": qa_result.get("screenshot_path", ""),
         "status": "qa_passed" if qa_result.get("passed") else "qa_failed",
     }
