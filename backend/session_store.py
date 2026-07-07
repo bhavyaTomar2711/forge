@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 
+import github_auth
+from agents.git import ship
 from graph.graph import graph
 from graph.state import DEFAULT_MAX_RETRIES, SessionState
 from paths import SESSIONS_DIR
@@ -103,3 +105,28 @@ def continue_session(session_id: str, task: str, *,
     final = graph.invoke(prior)
     save(final)
     return final
+
+
+# ---------- ship to GitHub ----------
+
+def ship_session(session_id: str, *, branch: str | None = None,
+                 commit_message: str | None = None) -> dict:
+    """User-triggered: take the saved session's current edits, commit them
+    on a new branch, push to GitHub, and open a PR. Uses the saved GitHub
+    token (device flow or PAT). The result includes the PR URL.
+
+    This is the ONLY path that touches the remote -- the pipeline never
+    pushes from the graph itself."""
+    state = load(session_id)
+    if state is None:
+        raise KeyError(f"no saved session: {session_id}")
+    if not state.get("build_passed"):
+        raise RuntimeError("cannot ship: build did not pass on the last turn")
+    token = github_auth.load_token()
+    if not token:
+        raise RuntimeError("not logged in to GitHub -- run github_auth.login() first")
+    result = ship(state, token=token, branch=branch, commit_message=commit_message)
+    state["pr_url"] = result.get("pr_url", "")
+    state["pr_branch"] = result.get("branch", "")
+    save(state)
+    return result

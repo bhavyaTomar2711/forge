@@ -31,6 +31,8 @@ class SessionState(TypedDict, total=False):
     failure_message: str          # user-facing summary when retries are exhausted
     preview_url: str              # live local URL the running app is reachable at
     preview_screenshot: str       # path to the latest Playwright screenshot of the app
+    pr_url: str                   # GitHub PR URL after ship_session() succeeds
+    pr_branch: str                # branch name pushed for the PR
 
     # --- control ---
     retry_count: int

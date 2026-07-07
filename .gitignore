@@ -46,3 +46,4 @@ __pycache__/
 *.pyo
 backend/.env
 backend/sessions/
+backend/.github_token
